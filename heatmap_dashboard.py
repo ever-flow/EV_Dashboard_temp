@@ -3,7 +3,7 @@
 환율 통일 및 ROE 일반화 버전: 2025-06-24
 * ROE를 일반적인 방법으로 계산 (Net Income / Equity)
 * 환율 적용하여 모든 절대값 지표를 USD로 통일
-* pasted_content_2.txt의 독창적인 AGG, MED, HRM, AVG 계산법 유지
+* calculation.txt의 AGG 계산법 통합 및 사용자 선택에 따른 집계 개선
 """
 
 import streamlit as st
@@ -56,7 +56,7 @@ def convert_to_usd(value, country):
 @st.cache_data(show_spinner=True)
 def load_real_data() -> pd.DataFrame:
     """실제 데이터를 로드하고 전처리하는 함수"""
-    df = pd.read_excel('/home/ubuntu/upload/heatmap_data_with_SE_v2.xlsx')
+    df = pd.read_excel('heatmap_data_with_SE_v2.xlsx', sheet_name='Sheet1')
     
     # EMSEC1~5가 모두 결측인 기업 제외
     emsec_cols = [f'EMSEC{i}' for i in range(1, 6)]
@@ -71,7 +71,7 @@ def load_real_data() -> pd.DataFrame:
         'Prime (Foreign Stocks)': '일본'
     }
     df['Country'] = df['market'].map(market_country_map).fillna('Unclassified')
-    df['Market'] = df['market']
+    df['Market'] = df['market'].replace('KOSDAQ GLOBAL', 'KOSDAQ')  # KOSDAQ GLOBAL을 KOSDAQ으로 통합
     
     return df
 
@@ -245,7 +245,6 @@ def calculate_financial_metrics_with_currency_conversion(df: pd.DataFrame) -> pd
         # EBITDA/Sales
         ebitda_col = f'EBITDA ({period})'
         if f'EBITDA ({period})_USD' in df.columns and revenue_col in df.columns:
-            # EBITDA는 USD로 계산했으므로 원래 화폐로 역산하여 비율 계산
             df[f'EBITDA/Sales ({period})'] = safe_divide(df[ebit_col] + df.get(f'Depreciation ({period})', 0), df[revenue_col])
         
         # 총자산이익률
@@ -273,7 +272,7 @@ def calculate_financial_metrics_with_currency_conversion(df: pd.DataFrame) -> pd
 def prepare_streamlit_data(df: pd.DataFrame) -> pd.DataFrame:
     """Streamlit에서 사용할 수 있는 형태로 데이터 준비"""
     if 'Company' not in df.columns:
-        df['Company'] = df.index.astype(str)
+        df['Company'] = df['ticker']
     
     years = ['LTM', 'LTM-1', 'LTM-2', 'LTM-3']
     final_rows = []
@@ -331,61 +330,89 @@ def load_processed_data() -> pd.DataFrame:
 DF_RAW = load_processed_data()
 
 ###############################################################################
-# 3. Accurate Aggregation Functions (pasted_content_2.txt 기준)
+# 3. Accurate Aggregation Functions
 ###############################################################################
-def accurate_harmonic_mean(s: pd.Series) -> float:
-    """NH (Harmonic Mean) - pasted_content_2.txt의 정확한 구현"""
-    arr = s.dropna()
-    arr = arr[arr > 0]  # 양수만 사용
-    if len(arr) == 0:
-        return np.nan
-    return len(arr) / np.sum(1.0 / arr)
-
-def accurate_aggregate_with_outlier_removal(s: pd.Series, market_cap_series: pd.Series = None) -> float:
-    """AG1 (Aggregate) - pasted_content_2.txt의 정확한 구현"""
-    arr = s.dropna()
-    if len(arr) == 0:
-        return np.nan
-    
-    # Market Cap이 있는 경우 이상치 제거 (PER, EV/EBITDA 등에 사용)
-    if market_cap_series is not None:
-        mc_arr = market_cap_series.dropna()
-        if len(mc_arr) == 0:
-            return np.nan
-        
-        # IQR 기반 이상치 제거 (Q1 - 2*IQR ~ Q3 + 2*IQR)
-        q1 = mc_arr.quantile(0.25)
-        q3 = mc_arr.quantile(0.75)
-        iqr = q3 - q1
-        lower_bound = q1 - 2 * iqr  # 2*IQR 사용 (더 관대한 기준)
-        upper_bound = q3 + 2 * iqr
-        
-        # 이상치 제거된 인덱스
-        valid_mask = (mc_arr >= lower_bound) & (mc_arr <= upper_bound)
-        filtered_arr = arr[valid_mask]
-        
-        if len(filtered_arr) == 0:
-            return np.nan
-        
-        return filtered_arr.sum()
-    else:
-        # Market Cap이 없는 경우 단순 합계
-        return arr.sum()
-
-def apply_filter_option(s: pd.Series, filter_option: str) -> pd.Series:
+def apply_filter_option(arr: pd.Series, filter_option: str) -> pd.Series:
     """필터 옵션 적용"""
-    s2 = s.dropna()
     if filter_option == "0이하 제외":
-        s2 = s2[s2 > 0]
+        arr = arr[arr > 0]
     elif filter_option == "이상치 제거":
-        if len(s2) > 0:
-            Q1 = s2.quantile(0.25)
-            Q3 = s2.quantile(0.75)
+        if len(arr) > 0:
+            Q1 = arr.quantile(0.25)
+            Q3 = arr.quantile(0.75)
             IQR = Q3 - Q1
             lower = Q1 - 1.5 * IQR
             upper = Q3 + 1.5 * IQR
-            s2 = s2[(s2 >= lower) & (s2 <= upper)]
-    return s2
+            arr = arr[(arr >= lower) & (arr <= upper)]
+    return arr
+
+def compute_aggregate(sub_df, metric, agg_func, year_sel, filter_option, group_sel, metric_main, metric_mode, base_col):
+    """calculation.txt 기반의 집계 함수"""
+    if group_sel == "기업":
+        if metric_main == "기업수":
+            if metric_mode == "결측 포함":
+                return len(sub_df)
+            else:
+                return sub_df[base_col].isna().sum() / len(sub_df) if len(sub_df) > 0 else np.nan
+        elif metric_main == "0이하비율":
+            arr = pd.to_numeric(sub_df[base_col], errors="coerce")
+            if metric_mode == "결측 제외":
+                arr = arr.dropna()
+            return (arr <= 0).sum() / len(arr) if len(arr) > 0 else np.nan
+    else:
+        if agg_func == "AGG":
+            if metric in ['PER', 'PBR', 'EV_EBITDA']:
+                # Filter based on market_cap (calculation.txt의 AGG 방식 반영)
+                mc_col = 'Market Cap (2024-12-31)_USD'
+                if mc_col not in sub_df.columns or sub_df[mc_col].isna().all():
+                    return np.nan
+                mc = sub_df[mc_col]
+                q1 = mc.quantile(0.25)
+                q3 = mc.quantile(0.75)
+                iqr = q3 - q1
+                lower = q1 - 2 * iqr
+                upper = q3 + 2 * iqr
+                filtered = sub_df[(mc >= lower) & (mc <= upper)]
+                if filtered.empty:
+                    return np.nan
+                if metric == 'PER':
+                    num = filtered['Market Cap (2024-12-31)_USD'].sum()
+                    den = filtered['Net_Income'].sum()  # 'Net_Income' is f'Net Income ({year_sel})_USD'
+                elif metric == 'PBR':
+                    num = filtered['Market Cap (2024-12-31)_USD'].sum()
+                    den = filtered['Book'].sum()  # 'Book' is f'Equity ({year_sel})_USD'
+                elif metric == 'EV_EBITDA':
+                    num = filtered['Enterprise Value (FQ0)_USD'].sum()
+                    den = filtered['EBITDA'].sum()  # 'EBITDA' is f'EBITDA ({year_sel})_USD'
+                return num / den if den > 0 else np.nan
+            else:
+                # 다른 지표의 경우 필터링 후 합계
+                mc_col = 'Market Cap (2024-12-31)_USD'
+                if mc_col not in sub_df.columns or sub_df[mc_col].isna().all():
+                    return np.nan
+                mc = sub_df[mc_col]
+                q1 = mc.quantile(0.25)
+                q3 = mc.quantile(0.75)
+                iqr = q3 - q1
+                lower = q1 - 2 * iqr
+                upper = q3 + 2 * iqr
+                filtered = sub_df[(mc >= lower) & (mc <= upper)]
+                if filtered.empty:
+                    return np.nan
+                arr = filtered[metric]
+                arr = apply_filter_option(arr, filter_option)
+                return arr.sum() if len(arr) > 0 else np.nan
+        else:
+            arr = sub_df[metric].dropna()
+            arr = apply_filter_option(arr, filter_option)
+            if len(arr) == 0:
+                return np.nan
+            if agg_func == "AVG":
+                return arr.mean()
+            elif agg_func == "MED":
+                return arr.median()
+            elif agg_func == "HRM":
+                return len(arr) / (1.0 / arr).sum() if len(arr) > 0 else np.nan
 
 ###############################################################################
 # 4. UI (기존 구조 유지)
@@ -394,22 +421,13 @@ main_tab, other1_tab, other2_tab = st.tabs(["Heatmap", "(WIP) 시각화A", "(WIP
 
 with main_tab:
     with st.sidebar:
-        # 환율 정보 표시
-        st.markdown("**환율 정보 (2024-12-31 기준)**")
-        st.caption("모든 절대값 지표는 USD로 통일됨")
-        for country, rate in EXCHANGE_RATES.items():
-            if country != 'Unclassified':
-                currency = {'한국': 'KRW', '미국': 'USD', '일본': 'JPY'}[country]
-                st.caption(f"{country}: 1 USD = {rate:,.0f} {currency}")
-        st.markdown("---")
-        
         st.markdown("**기준 연도**")
         year_sel = st.selectbox("", ["LTM", "LTM-1", "LTM-2", "LTM-3"], label_visibility="collapsed")
 
         st.markdown("**상장시장**")
         market_options = [
             "전체",
-            "한국 전체", "KOSPI", "KOSDAQ", "KOSDAQ GLOBAL",
+            "한국 전체", "KOSPI", "KOSDAQ",
             "미국 전체", "NASDAQ",
             "일본 전체", "Prime (Domestic Stocks)", "Standard (Domestic Stocks)", "Prime (Foreign Stocks)",
         ]
@@ -528,44 +546,6 @@ with main_tab:
     else:
         col_index = "Sub_Technology"
 
-    ###############################################################################
-    # 6. Accurate Aggregation (pasted_content_2.txt 기준)
-    ###############################################################################
-    def aggregator(s: pd.Series) -> float:
-        if group_sel == "기업":
-            if metric_main == "기업수":
-                return len(s) if metric_mode == "결측 포함" else s.isna().sum() / len(s) if len(s) else np.nan
-            arr = pd.to_numeric(s, errors="coerce")
-            arr = arr if metric_mode == "결측 포함" else arr.dropna()
-            return (arr <= 0).sum() / len(arr) if len(arr) else np.nan
-        
-        # 필터 적용
-        arr = apply_filter_option(s, filter_option) if filter_option else s.dropna()
-        if len(arr) == 0:
-            return np.nan
-        
-        # 정확한 집계 함수 적용
-        if agg_func == "AVG":  # SA (Simple Average)
-            return arr.mean()
-        elif agg_func == "MED":  # MD (Median)
-            return arr.median()
-        elif agg_func == "HRM":  # NH (Harmonic Mean)
-            return accurate_harmonic_mean(arr)
-        elif agg_func == "AGG":  # AG1 (Aggregate with outlier removal)
-            # Market Cap 정보가 필요한 경우 (PER, EV_EBITDA 등)
-            if metric_main in ["PER", "EV_EBITDA"]:
-                # 해당 그룹의 Market Cap 데이터 가져오기 (USD 기준)
-                market_cap_col = 'Market Cap (2024-12-31)_USD'
-                if market_cap_col in DF.columns:
-                    mc_series = DF.loc[s.index, market_cap_col] if hasattr(s, 'index') else None
-                    return accurate_aggregate_with_outlier_removal(arr, mc_series)
-            return accurate_aggregate_with_outlier_removal(arr)
-        
-        return np.nan
-
-    ###############################################################################
-    # 7. Pivot & Visualization (기존 구조 유지)
-    ###############################################################################
     values_col = (
         base_col if group_sel == "기업" and metric_main == "0이하비율" else
         metric_main if group_sel != "기업" else "Company"
@@ -578,19 +558,11 @@ with main_tab:
         st.warning("조건에 맞는 데이터가 없습니다.")
         st.stop()
 
-    pivot_main = pd.pivot_table(
-        DF,
-        values=values_col,
-        index=row_index,
-        columns=col_index,
-        aggfunc=aggregator,
-        fill_value=np.nan,
-        observed=True,
-    )
-    pivot_counts = pd.pivot_table(
-        DF, index=row_index, columns=col_index,
-        aggfunc="size", fill_value=0, observed=True
-    )
+    # Pivot tables
+    pivot_main = DF.groupby([row_index, col_index]).apply(
+        lambda g: compute_aggregate(g, values_col, agg_func, year_sel, filter_option, group_sel, metric_main, metric_mode, base_col)
+    ).unstack(fill_value=np.nan)
+    pivot_counts = DF.groupby([row_index, col_index]).size().unstack(fill_value=0)
 
     if pivot_main.empty:
         st.warning("피벗 테이블을 생성할 수 없습니다.")
@@ -602,9 +574,17 @@ with main_tab:
 
     # Sub-/Grand-Totals 계산
     if allow_subtotal:
-        row_tot = DF.groupby(row_index)[values_col].agg(aggregator).reindex(y_orig)
-        col_tot = DF.groupby(col_index)[values_col].agg(aggregator).reindex(x_orig)
-        grand_tot = aggregator(DF[values_col])
+        # Row totals
+        row_tot = DF.groupby(row_index).apply(
+            lambda g: compute_aggregate(g, values_col, agg_func, year_sel, filter_option, group_sel, metric_main, metric_mode, base_col)
+        ).reindex(y_orig)
+        # Column totals
+        col_tot = DF.groupby(col_index).apply(
+            lambda g: compute_aggregate(g, values_col, agg_func, year_sel, filter_option, group_sel, metric_main, metric_mode, base_col)
+        ).reindex(x_orig)
+        # Grand total
+        grand_tot = compute_aggregate(DF, values_col, agg_func, year_sel, filter_option, group_sel, metric_main, metric_mode, base_col)
+        # Counts
         row_cnt = DF.groupby(row_index).size().reindex(y_orig)
         col_cnt = DF.groupby(col_index).size().reindex(x_orig)
         grand_cnt = len(DF)
@@ -644,7 +624,7 @@ with main_tab:
     elif group_sel == "기업" or (group_sel == "재무비율" and (agg_func != "AGG")):
         fmt = lambda v: f"{v*100:.1f}%" if pd.notna(v) else ""
     else:
-        # 절대값 지표의 경우 USD 단위 표시
+        # 비교가치 멀티플 및 AGG 선택 시
         if metric_main in ["PER", "PBR", "EV_EBITDA"]:
             fmt = lambda v: f"{v:,.2f}" if pd.notna(v) else ""
         else:
@@ -740,9 +720,9 @@ with main_tab:
     unique_companies = len(DF['Company'].drop_duplicates()) if 'Company' in DF.columns else len(DF)
     total_classifications = len(DF)
     st.caption(f"고유 기업 수: {unique_companies:,} | 총 분류 조합 수: {total_classifications:,} | 절대값 지표: USD 기준")
+    st.caption("참고: '0이하 비율'은 해당 지표가 0 이하인 기업의 비율을 나타냅니다. '결측 제외' 시 결측치는 제외되며, '결측 포함' 시 결측치는 0 이하로 간주되지 않습니다.")
 
 with other1_tab:
     st.info("추가 시각화 A — 준비 중입니다.")
 with other2_tab:
     st.info("추가 시각화 B — 준비 중입니다.")
-
